@@ -1,2 +1,13 @@
-# esp32-iot-temperature-monitor
-ESP32 IoT temperature monitoring system using DS18B20 sensor with WiFi and cloud integration.
+# ESP32 Temperature Monitor
+
+Embedded firmware project using ESP-IDF.
+
+## Features
+- ESP32
+- C
+- FreeRTOS
+- DS18B20 temperature sensor
+- Git version control
+
+## Architecture
+Sensor Task → Queue → Logger Task
