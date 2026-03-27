@@ -1,0 +1,9 @@
+dependencies:
+  onewire_bus: ^1.0.0
+description: DS18B20 device driver
+repository: git://github.com/espressif/esp-bsp.git
+repository_info:
+  commit_sha: c2dc48e96a0ffa1e96cf28f4a6bcb203136550f0
+  path: components/ds18b20
+url: https://github.com/espressif/esp-bsp/tree/master/components/ds18b20
+version: 0.3.0
