@@ -23,25 +23,6 @@ Real-time embedded system using ESP32 and FreeRTOS to monitor temperature from a
 - **Main App (temp_monitor)** – Coordinates tasks and logic
 - **FreeRTOS Tasks** – Sensor task + UART task
 
----
-
-## 📸 Hardware Setup
-
-![hardware](images/hardware.jpg)
-
----
-
-## 💻 UART Output (Live Data)
-
-![uart](images/uart_output.jpg)
-
----
-
-## 🚨 Alert System & Average Calculation
-
-![alert](images/alert_output.jpg)
-
----
 
 ## 🧪 CLI Commands
 
