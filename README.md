@@ -28,6 +28,7 @@ The system is designed using a modular real-time architecture with clear separat
 ### Data Flow
 
 Sensor Task → Queue → Processing Task → System State
+
 ↓
 UART CLI
 
