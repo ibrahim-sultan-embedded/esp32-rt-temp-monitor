@@ -11,6 +11,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 
@@ -18,12 +19,33 @@
 #include "line_proto.h"
 
 #define TEMP_HISTORY_SIZE 10
+#define TEMP_QUEUE_LEN    8
+
+typedef enum {
+    STATE_NORMAL = 0,
+    STATE_WARNING,
+    STATE_CRITICAL
+} system_state_t;
+
+typedef struct {
+    float temperature;
+    TickType_t timestamp;
+    bool valid;
+} temp_msg_t;
+
+typedef struct {
+    float last_temp;
+    float avg_temp;
+    float threshold;
+    system_state_t state;
+    uint32_t sample_count;
+    uint32_t error_count;
+} monitor_data_t;
 
 static float temp_history[TEMP_HISTORY_SIZE];
 static int temp_index = 0;
 static int temp_count = 0;
 
-static float g_threshold = 30.0;
 static const char *TAG = "app";
 
 static uart_drv_t g_uart = {
@@ -36,7 +58,16 @@ static uart_drv_t g_uart = {
 
 static bool g_echo = true;
 static uint32_t g_temp_period_ms = 5000;
-static float g_last_temp = 25.0f;
+static QueueHandle_t g_temp_queue = NULL;
+
+static monitor_data_t g_monitor = {
+    .last_temp = 25.0f,
+    .avg_temp = 25.0f,
+    .threshold = 30.0f,
+    .state = STATE_NORMAL,
+    .sample_count = 0,
+    .error_count = 0
+};
 
 /* ----------------- utils ----------------- */
 
@@ -60,6 +91,39 @@ static void cli_write_ln(uart_drv_t *u, const char *msg)
     if (!u || !msg) return;
     uart_drv_write(u, (const uint8_t *)msg, strlen(msg));
     uart_drv_write(u, (const uint8_t *)"\r\n", 2);
+}
+
+static const char *state_to_str(system_state_t s)
+{
+    switch (s) {
+        case STATE_NORMAL:   return "NORMAL";
+        case STATE_WARNING:  return "WARNING";
+        case STATE_CRITICAL: return "CRITICAL";
+        default:             return "UNKNOWN";
+    }
+}
+
+static system_state_t calc_state(float temp, float threshold)
+{
+    if (temp >= threshold + 5.0f) {
+        return STATE_CRITICAL;
+    }
+    if (temp >= threshold) {
+        return STATE_WARNING;
+    }
+    return STATE_NORMAL;
+}
+
+static float get_avg_temp(void)
+{
+    if (temp_count == 0) return 0.0f;
+
+    float sum = 0.0f;
+    for (int i = 0; i < temp_count; i++) {
+        sum += temp_history[i];
+    }
+
+    return sum / temp_count;
 }
 
 /* ----------------- CLI types ----------------- */
@@ -131,6 +195,9 @@ static int cmd_help(uart_drv_t *u, int argc, char **argv)
         uart_drv_write(u, (const uint8_t *)g_cmds[i].help, strlen(g_cmds[i].help));
         uart_drv_write(u, (const uint8_t *)"\r\n", 2);
     }
+
+    cli_write_ln(u, "  avg - Show average temperature");
+    cli_write_ln(u, "  set_th <temp> - Set warning threshold");
     return 0;
 }
 
@@ -139,14 +206,19 @@ static int cmd_status(uart_drv_t *u, int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    char buf[128];
+    char buf[192];
     snprintf(buf, sizeof(buf),
-             "OK: uart=%d baud=%d echo=%s period=%lu ms temp=%.2f C",
+             "OK: uart=%d baud=%d echo=%s period=%lu ms temp=%.2f C avg=%.2f C threshold=%.2f C state=%s errors=%lu samples=%lu",
              (int)g_uart.uart_num,
              g_uart.baud,
              g_echo ? "on" : "off",
              (unsigned long)g_temp_period_ms,
-             g_last_temp);
+             g_monitor.last_temp,
+             g_monitor.avg_temp,
+             g_monitor.threshold,
+             state_to_str(g_monitor.state),
+             (unsigned long)g_monitor.error_count,
+             (unsigned long)g_monitor.sample_count);
 
     cli_write_ln(u, buf);
     return 0;
@@ -181,7 +253,7 @@ static int cmd_temp(uart_drv_t *u, int argc, char **argv)
     (void)argv;
 
     char buf[64];
-    snprintf(buf, sizeof(buf), "temperature=%.2f C", g_last_temp);
+    snprintf(buf, sizeof(buf), "temperature=%.2f C", g_monitor.last_temp);
     cli_write_ln(u, buf);
     return 0;
 }
@@ -238,18 +310,6 @@ static int cmd_get(uart_drv_t *u, int argc, char **argv)
     return 0;
 }
 
-static float get_avg_temp(void)
-{
-    if (temp_count == 0) return 0;
-
-    float sum = 0;
-    for (int i = 0; i < temp_count; i++) {
-        sum += temp_history[i];
-    }
-
-    return sum / temp_count;
-}
-
 /* ----------------- CLI dispatcher ----------------- */
 
 static void cli_handle_line(uart_drv_t *u, const char *line_in)
@@ -273,30 +333,26 @@ static void cli_handle_line(uart_drv_t *u, const char *line_in)
     }
 
     if (strcmp(line, "avg") == 0) {
-    float avg = get_avg_temp();
-    char buf[64];
-    snprintf(buf, sizeof(buf), "avg=%.2f C", avg);
-    cli_write_ln(u, buf);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "avg=%.2f C", g_monitor.avg_temp);
+        cli_write_ln(u, buf);
     }
     else if (strncmp(line, "set_th ", 7) == 0) {
-    float th = atof(line + 7);
-    g_threshold = th;
+        float th = atof(line + 7);
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "threshold=%.2f C", g_threshold);
-    cli_write_ln(u, buf);
+        if (th < -55.0f || th > 125.0f) {
+            cli_write_ln(u, "ERR: threshold out of range");
+            return;
+        }
+
+        g_monitor.threshold = th;
+
+        char buf[64];
+        snprintf(buf, sizeof(buf), "threshold=%.2f C", g_monitor.threshold);
+        cli_write_ln(u, buf);
     }
-    else if (strcmp(line, "status") == 0) {
-    char buf[128];
-    snprintf(buf, sizeof(buf),
-        "Temp=%.2f C | Period=%lu ms | Threshold=%.2f",
-        g_last_temp,
-        (unsigned long)g_temp_period_ms,
-        g_threshold);
-
-    cli_write_ln(u, buf);
-    } else {
-    cli_write_ln(u, "ERR: unknown command (type: help)");
+    else {
+        cli_write_ln(u, "ERR: unknown command (type: help)");
     }
 }
 
@@ -324,9 +380,11 @@ static void uart_rx_task(void *arg)
                 if (g_echo) {
                     uart_drv_write(&g_uart, &b, 1);
                 }
-                if(b== '\r'){
-                    b= '\n';
+
+                if (b == '\r') {
+                    b = '\n';
                 }
+
                 if (line_proto_feed(&proto, (char)b)) {
                     const char *line = line_proto_get_line(&proto);
                     if (line) {
@@ -344,30 +402,71 @@ static void temperature_task(void *arg)
     (void)arg;
 
     float temp = 0.0f;
+    temp_msg_t msg;
 
-    ds18b20_init(4);
+    if (!ds18b20_init(4)) {
+        ESP_LOGE(TAG, "DS18B20 init failed");
+    }
 
     while (1) {
+        msg.timestamp = xTaskGetTickCount();
+
         if (ds18b20_read_temp(&temp)) {
-            g_last_temp = temp;
-            // save history
-            temp_history[temp_index] = temp;
+            msg.temperature = temp;
+            msg.valid = true;
+        } else {
+            msg.temperature = 0.0f;
+            msg.valid = false;
+        }
+
+        if (g_temp_queue != NULL) {
+            if (xQueueSend(g_temp_queue, &msg, pdMS_TO_TICKS(50)) != pdTRUE) {
+                ESP_LOGW(TAG, "temp queue full");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(g_temp_period_ms));
+    }
+}
+
+static void processing_task(void *arg)
+{
+    (void)arg;
+
+    temp_msg_t msg;
+
+    while (1) {
+        if (xQueueReceive(g_temp_queue, &msg, portMAX_DELAY) == pdTRUE) {
+            if (!msg.valid) {
+                g_monitor.error_count++;
+                ESP_LOGE(TAG, "Temp read error");
+                continue;
+            }
+
+            g_monitor.last_temp = msg.temperature;
+            g_monitor.sample_count++;
+
+            temp_history[temp_index] = msg.temperature;
             temp_index = (temp_index + 1) % TEMP_HISTORY_SIZE;
 
             if (temp_count < TEMP_HISTORY_SIZE) {
-                  temp_count++;
+                temp_count++;
             }
 
-            // threshold check
-            if (temp > g_threshold) {
-                 ESP_LOGW(TAG, "WARNING: High temperature %.2f C", temp);
-            } 
-           //ESP_LOGI(TAG, "Temp: %.2f C", temp);
-             } else {
-                    ESP_LOGE(TAG, "Temp read error");
-             }
+            g_monitor.avg_temp = get_avg_temp();
+            g_monitor.state = calc_state(msg.temperature, g_monitor.threshold);
 
-        vTaskDelay(pdMS_TO_TICKS(g_temp_period_ms));
+            if (g_monitor.state == STATE_WARNING) {
+                ESP_LOGW(TAG, "WARNING: High temperature %.2f C", msg.temperature);
+            } else if (g_monitor.state == STATE_CRITICAL) {
+                ESP_LOGE(TAG, "CRITICAL: Temperature %.2f C", msg.temperature);
+            } else {
+                ESP_LOGI(TAG, "Temp: %.2f C | Avg: %.2f C | State: %s",
+                         g_monitor.last_temp,
+                         g_monitor.avg_temp,
+                         state_to_str(g_monitor.state));
+            }
+        }
     }
 }
 
@@ -379,8 +478,15 @@ void app_main(void)
 
     ESP_ERROR_CHECK(uart_drv_init(&g_uart));
 
+    g_temp_queue = xQueueCreate(TEMP_QUEUE_LEN, sizeof(temp_msg_t));
+    if (g_temp_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create temp queue");
+        return;
+    }
+
     xTaskCreate(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL);
     xTaskCreate(temperature_task, "temp_task", 4096, NULL, 5, NULL);
+    xTaskCreate(processing_task, "proc_task", 4096, NULL, 5, NULL);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
